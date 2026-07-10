@@ -1,28 +1,67 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+
+// Radix Select calls scrollIntoView on its items when the content opens; jsdom
+// doesn't implement it (nor hasPointerCapture / releasePointerCapture), so stub
+// them to let the dropdown open in tests.
+beforeAll(() => {
+  Element.prototype.scrollIntoView = vi.fn()
+  Element.prototype.hasPointerCapture = vi.fn(() => false)
+  Element.prototype.releasePointerCapture = vi.fn()
+})
 
 const getGlobalModelInfo = vi.fn()
 const getGlobalModelOptions = vi.fn()
 const getAuxiliaryModels = vi.fn()
+const getMoaModels = vi.fn()
 const setModelAssignment = vi.fn()
+const getRecommendedDefaultModel = vi.fn()
+const saveMoaModels = vi.fn()
+const setEnvVar = vi.fn()
+const getHermesConfigRecord = vi.fn()
+const saveHermesConfig = vi.fn()
+const startManualProviderOAuth = vi.fn()
 
 vi.mock('@/hermes', () => ({
   getGlobalModelInfo: () => getGlobalModelInfo(),
   getGlobalModelOptions: () => getGlobalModelOptions(),
   getAuxiliaryModels: () => getAuxiliaryModels(),
-  setModelAssignment: (body: unknown) => setModelAssignment(body)
+  getMoaModels: () => getMoaModels(),
+  setModelAssignment: (body: unknown) => setModelAssignment(body),
+  getRecommendedDefaultModel: (slug: string) => getRecommendedDefaultModel(slug),
+  saveMoaModels: (body: unknown) => saveMoaModels(body),
+  setEnvVar: (key: string, value: string) => setEnvVar(key, value),
+  getHermesConfigRecord: () => getHermesConfigRecord(),
+  saveHermesConfig: (config: unknown) => saveHermesConfig(config)
+}))
+
+vi.mock('@/store/onboarding', () => ({
+  startManualProviderOAuth: (slug: string) => startManualProviderOAuth(slug)
 }))
 
 beforeEach(() => {
   getGlobalModelInfo.mockResolvedValue({ provider: 'nous', model: 'hermes-4' })
   getGlobalModelOptions.mockResolvedValue({
-    providers: [{ name: 'Nous', slug: 'nous', models: ['hermes-4', 'hermes-4-mini'] }]
+    providers: [
+      {
+        name: 'Nous',
+        slug: 'nous',
+        models: ['hermes-4', 'hermes-4-mini'],
+        authenticated: true,
+        capabilities: { 'hermes-4': { reasoning: true, fast: true } }
+      }
+    ]
   })
   getAuxiliaryModels.mockResolvedValue({
     main: { provider: 'nous', model: 'hermes-4' },
     tasks: [{ task: 'vision', provider: 'auto', model: '', base_url: '' }]
   })
+  getMoaModels.mockResolvedValue(null)
   setModelAssignment.mockResolvedValue({ provider: 'nous', model: 'hermes-4', gateway_tools: [] })
+  getRecommendedDefaultModel.mockResolvedValue({ provider: 'nous', model: 'hermes-4', free_tier: null })
+  setEnvVar.mockResolvedValue({ ok: true })
+  getHermesConfigRecord.mockResolvedValue({ agent: { reasoning_effort: 'medium', service_tier: 'normal' } })
+  saveHermesConfig.mockResolvedValue({ ok: true })
 })
 
 afterEach(() => {
@@ -37,14 +76,52 @@ async function renderModelSettings() {
 }
 
 describe('ModelSettings', () => {
-  it('loads and shows the current main model', async () => {
+  it('loads the current main model and lists configured providers only', async () => {
     await renderModelSettings()
 
     await waitFor(() => expect(getGlobalModelInfo).toHaveBeenCalled())
-    // The current model is loaded into the main-slot selectors (provider name
-    // + model id), not a standalone label.
-    expect(await screen.findByText('Nous')).toBeTruthy()
-    expect(screen.getByText('hermes-4')).toBeTruthy()
+    await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalled())
+
+    // Open the provider Select — only configured providers should be listed.
+    const triggers = await screen.findAllByRole('combobox')
+    fireEvent.click(triggers[0])
+
+    // "Nous" shows in both the trigger and the open list.
+    expect((await screen.findAllByText('Nous')).length).toBeGreaterThan(0)
+    expect(screen.queryByText(/DeepSeek/)).toBeNull()
+  })
+
+  it('writes the profile default speed (service_tier) when the fast switch is toggled', async () => {
+    await renderModelSettings()
+    await waitFor(() => expect(getHermesConfigRecord).toHaveBeenCalled())
+
+    const fastSwitch = await screen.findByRole('switch')
+    fireEvent.click(fastSwitch)
+
+    await waitFor(() =>
+      expect(saveHermesConfig).toHaveBeenCalledWith(
+        expect.objectContaining({ agent: expect.objectContaining({ service_tier: 'fast' }) })
+      )
+    )
+  })
+
+  it('hides the reasoning/speed defaults when the main model reports no capabilities', async () => {
+    getGlobalModelOptions.mockResolvedValueOnce({
+      providers: [
+        {
+          name: 'Nous',
+          slug: 'nous',
+          models: ['hermes-4'],
+          authenticated: true,
+          capabilities: { 'hermes-4': { reasoning: false, fast: false } }
+        }
+      ]
+    })
+
+    await renderModelSettings()
+    await waitFor(() => expect(getHermesConfigRecord).toHaveBeenCalled())
+
+    expect(screen.queryByRole('switch')).toBeNull()
   })
 
   it('renders the auxiliary task rows', async () => {
